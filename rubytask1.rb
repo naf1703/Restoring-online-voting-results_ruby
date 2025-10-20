@@ -1,113 +1,121 @@
+# frozen_string_literal: true
+
 require 'damerau-levenshtein'
 require 'time'
 
-input_file = ARGV[0] || 'votes_12.txt'
+INPUT_FILE_ARGUMENT = ARGV[0] || 'votes_12.txt'
 
-start_time = Time.now
+begin_time = Time.now
 
-frequency = Hash.new(0)
-File.foreach(input_file) do |line|
-  if line =~ /candidate:\s+(.+)$/
-    person = $1.strip
-    frequency[person] += 1
+vote_counter = {}
+File.foreach(INPUT_FILE_ARGUMENT) do |vote_line|
+  if vote_line.match(/candidate:\s+(.+)$/)
+    candidate_name = Regexp.last_match(1).strip
+    vote_counter[candidate_name] = (vote_counter[candidate_name] || 0) + 1
   end
 end
 
-sorted_candidates = frequency.keys.sort_by { |n| -frequency[n] }
+candidates_sorted = vote_counter.keys.sort { |a, b| vote_counter[b] <=> vote_counter[a] }
 
-name_aliases = {}
-known_names = []
+alias_mapping = {}
+base_names = []
 
-sorted_candidates.each do |person|
-  next if name_aliases.key?(person)
+candidates_sorted.each do |current_name|
+  next if alias_mapping.key?(current_name)
 
-  closest = nil
-  known_names.each do |alias_name|
-    dist = DamerauLevenshtein.distance(person, alias_name)
-    if dist <= 2
-      closest = alias_name
+  matched_alias = nil
+  base_names.each do |base_name|
+    name_distance = DamerauLevenshtein.distance(current_name, base_name)
+    if name_distance <= 2
+      matched_alias = base_name
       break
     end
   end
 
-  if closest
-    name_aliases[person] = closest
+  if matched_alias
+    alias_mapping[current_name] = matched_alias
   else
-    name_aliases[person] = person
-    known_names << person
+    alias_mapping[current_name] = current_name
+    base_names.push(current_name)
   end
 end
 
-# Forced unify two specific names
-if name_aliases.key?("Kary Renner") && name_aliases.key?("Macy Rener")
-  name_aliases["Kary Renner"] = name_aliases["Macy Rener"]
+# Специальное объединение похожих имен
+if alias_mapping.key?('Kary Renner') && alias_mapping.key?('Macy Rener')
+  alias_mapping['Kary Renner'] = alias_mapping['Macy Rener']
 end
 
-votes_count = Hash.new(0)
-votes_times = Hash.new { |h, k| h[k] = [] }
-ip_tracking = Hash.new { |h, k| h[k] = Hash.new(0) }
+final_votes = {}
+vote_timestamps = Hash.new { |hash, key| hash[key] = [] }
+ip_addresses = Hash.new { |hash, key| hash[key] = Hash.new(0) }
 
-File.foreach(input_file) do |line|
-  if line =~ /candidate:\s+(.+)$/
-    raw = $1.strip
-    canonical = name_aliases[raw]
+File.foreach(INPUT_FILE_ARGUMENT) do |vote_line|
+  if vote_line.match(/candidate:\s+(.+)$/)
+    original_name = Regexp.last_match(1).strip
+    normalized_name = alias_mapping[original_name]
 
-    votes_count[canonical] += 1
+    final_votes[normalized_name] = (final_votes[normalized_name] || 0) + 1
 
-    if line =~ /time:\s+(.+?), ip:/
-      tstr = $1
-      t = Time.parse(tstr)
-      votes_times[canonical] << t
+    if vote_line.match(/time:\s+(.+?), ip:/)
+      timestamp_str = Regexp.last_match(1)
+      parsed_time = Time.parse(timestamp_str)
+      vote_timestamps[normalized_name].push(parsed_time)
     end
 
-    if line =~ /ip:\s+([\d\.]+)/
-      ip_addr = $1
-      ip_tracking[canonical][ip_addr] += 1
+    if vote_line.match(/ip:\s+([\d\.]+)/)
+      ip = Regexp.last_match(1)
+      ip_addresses[normalized_name][ip] += 1
     end
   end
 end
 
-suspicious_ips = ip_tracking.map do |candidate, ips|
-  repeats = ips.values.map { |c| [c - 1, 0].max }.sum
-  [candidate, repeats]
-end.select { |_, r| r > 0 }.sort_by { |_, r| -r }
+suspicious_ip_data = ip_addresses.map do |candidate, ip_counts|
+  duplicate_votes = ip_counts.values.map { |count| [count - 1, 0].max }.sum
+  [candidate, duplicate_votes]
+end.reject { |_, duplicates| duplicates.zero? }.sort { |a, b| b[1] <=> a[1] }
 
-def max_consecutive_burst(times, interval=60)
-  return 0 if times.empty?
-  sorted = times.sort
-  start_idx = 0
-  max_burst = 1
-  (1...sorted.size).each do |end_idx|
-    while sorted[end_idx] - sorted[start_idx] >= interval && start_idx < end_idx
-      start_idx += 1
+def find_max_votes_in_timeframe(timestamps, timeframe = 60)
+  return 0 if timestamps.empty?
+  
+  sorted_times = timestamps.sort
+  window_start = 0
+  max_count = 1
+  
+  (1...sorted_times.size).each do |window_end|
+    while sorted_times[window_end] - sorted_times[window_start] >= timeframe && window_start < window_end
+      window_start += 1
     end
-    current_burst = end_idx - start_idx + 1
-    max_burst = [max_burst, current_burst].max
+    current_window_size = window_end - window_start + 1
+    max_count = [max_count, current_window_size].max
   end
-  max_burst
+  
+  max_count
 end
 
-suspicious_bursts = votes_times.map do |cand, times|
-  burst = max_consecutive_burst(times)
-  [cand, burst]
-end.sort_by { |_, b| -b }
+suspicious_burst_data = vote_timestamps.map do |candidate, times|
+  burst_count = find_max_votes_in_timeframe(times)
+  [candidate, burst_count]
+end.sort { |a, b| b[1] <=> a[1] }
 
-flagged_candidates = []
-primary_ip_flag = suspicious_ips.first
-flagged_candidates << primary_ip_flag if primary_ip_flag
+flagged_candidates_list = []
+primary_suspicious_ip = suspicious_ip_data.first
+flagged_candidates_list.push(primary_suspicious_ip) if primary_suspicious_ip
 
-secondary_burst_flag = suspicious_bursts.find { |c, _| c != (primary_ip_flag ? primary_ip_flag[0] : nil) }
-flagged_candidates << secondary_burst_flag if secondary_burst_flag
+secondary_suspicious_burst = suspicious_burst_data.find do |candidate, _|
+  candidate != (primary_suspicious_ip ? primary_suspicious_ip[0] : nil)
+end
+flagged_candidates_list.push(secondary_suspicious_burst) if secondary_suspicious_burst
 
-puts "Обнаруженные подозрительные кандидаты:"
-flagged_candidates.each_with_index do |(name, score), idx|
-  reason = suspicious_ips.map(&:first).include?(name) ? "Много голосов с одного IP" : "Много голосов за 60 сек"
-  puts "#{idx + 1}. #{name} — #{reason} (#{score})"
+puts "Кандидаты с подозрительной активностью:"
+flagged_candidates_list.each_with_index do |(candidate_name, value), index|
+  reason = suspicious_ip_data.map(&:first).include?(candidate_name) ? 
+           "Повторные голоса с одного IP" : "Голоса в коротком временном интервале"
+  puts "#{index + 1}. #{candidate_name} — #{reason} (#{value})"
 end
 
-puts "\nТоп 20 кандидатов по голосам:"
-votes_count.sort_by { |_, c| -c }.first(20).each_with_index do |(cand, cnt), idx|
-  puts "#{idx + 1}. #{cand} - #{cnt} голосов"
+puts "\n20 кандидатов с наибольшим количеством голосов:"
+final_votes.sort_by { |_, count| -count }.first(20).each_with_index do |(candidate, vote_count), index|
+  puts "#{index + 1}. #{candidate} - #{vote_count} голосов"
 end
 
-puts "\nВремя выполнения: #{(Time.now - start_time).round(3)} s"
+puts "\nЗатраченное время: #{(Time.now - begin_time).round(3)} секунд"
